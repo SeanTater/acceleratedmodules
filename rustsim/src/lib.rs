@@ -37,6 +37,8 @@ impl Simulation {
 
 
     /// Do exactly the same search Python does
+    ///
+    /// This method performs all it's conversions automatically
     fn simulate_demand_inner(&self, starting_quantity: usize) -> (usize, usize, usize, usize, f64, f64) {
         let mut successful_transactions = 0;
         let mut successful_sales = 0;
@@ -76,16 +78,19 @@ impl Simulation {
         (
             successful_transactions, successful_sales,
             failed_transactions, failed_sales,
+            // Rust enforces that floats and integers stay separate
             successful_transactions as f64 / (successful_transactions as f64 + failed_transactions as f64),
             successful_sales as f64 / (successful_sales as f64 + failed_sales as f64)
         )
     }
 
+    /// You can also perform the conversions manually, and you can get access to the Python GIL, which necessary in many cases
     fn simulate_demand(&self, py: Python<'_>, starting_quantity: usize) -> PyResult<PyObject> {
         Ok(self.simulate_demand_inner(starting_quantity).into_py(py))
     }
 
-    fn repeat_simulate_demand(&self, py: Python<'_>, starting_quantity: usize, count: usize) -> PyResult<PyObject> {
+    /// Repeat the simulation many times
+    fn repeat_simulate_demand(&self, starting_quantity: usize, count: usize) -> (usize, usize, usize, usize, f64, f64) {
         let (mut st, mut ss, mut ft, mut fs) = (0, 0, 0, 0);
         for _ in 0..count {
             let (xst, xss, xft, xfs, _, _) = self.simulate_demand_inner(starting_quantity);
@@ -94,7 +99,7 @@ impl Simulation {
             ft += xft;
             fs += xfs;
         }
-        Ok((st, ss, ft, fs, st/(st+ft), ss/(ss+fs)).into_py(py))
+        (st, ss, ft, fs, st as f64/(st as f64 +ft as f64), ss as f64 /(ss as f64+fs as f64))
     }
 }
 
