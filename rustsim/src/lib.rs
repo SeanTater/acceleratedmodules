@@ -3,13 +3,6 @@ use pyo3::wrap_pyfunction;
 use std::cmp::max;
 use rand::distributions::Distribution;
 
-
-#[pyfunction]
-/// Formats the sum of two numbers as string
-fn sum_as_string(a: usize, b: usize) -> PyResult<String> {
-    Ok((a + b).to_string())
-}
-
 #[pyclass(module = "rustsim")]
 struct Simulation {
     safety_stock: usize,
@@ -107,7 +100,6 @@ impl Simulation {
 /// This module is a python module implemented in Rust.
 #[pymodule]
 fn rustsim(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_wrapped(wrap_pyfunction!(sum_as_string))?;
     m.add_class::<Simulation>()?;
 
     Ok(())
