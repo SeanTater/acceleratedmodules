@@ -1,8 +1,24 @@
 Stock Simulation: An example of Python native modules
 =====================================================
 
+- [Stock Simulation: An example of Python native modules](#stock-simulation-an-example-of-python-native-modules)
+- [Basic Implementation](#basic-implementation)
+- [Cython Stock Simulation](#cython-stock-simulation)
+- [Rust Stock Simulation](#rust-stock-simulation)
+    - [Cargo.toml](#cargotoml)
+    - [lib.rs](#librs)
+    - [Compile your new module](#compile-your-new-module)
+- [Rust OpenCL Implementation](#rust-opencl-implementation)
+  - [Overview: writing for separate devices](#overview-writing-for-separate-devices)
+  - [Differences in the code](#differences-in-the-code)
+    - [Precomputed zipf distributions](#precomputed-zipf-distributions)
+    - [Other Differences](#other-differences)
+  - [Highlights](#highlights)
+  - [Installing it for production](#installing-it-for-production)
+  - [Installing it for debugging](#installing-it-for-debugging)
+
 Basic Implementation
---------------------
+====================
 
 The first method is written exactly as it sounds in the definition, with no
 flair or pizazz to improve performance, and mostly for legibility.
@@ -47,7 +63,7 @@ if __name__ == "__main__":
 
 
 Cython Stock Simulation
------------------------
+=======================
 Like several other versions, this is the lest modified version that would still run.
 In the case of Cython, that is byte-for-byte identical so there are no changes at all. This is
 really not the best case for Cython, because it can be improved a lot with some type restrictions.
@@ -70,7 +86,8 @@ Sadly, it's no improvement over bare Python as it stands. To get more out of it,
 a little. If you look at the resulting `simulation.c`, you can imagine why the result is not faster. There are tons of corner cases Python handles for you that make it convenient for you as a developer and a user but waste a ton of CPU cycles.
 
 Rust Stock Simulation
----------------------
+=====================
+
 Unlike Cython, Rust does require some rewriting to get started. In most cases the differences
 are essentially just syntactical, but zipf distributions are not built-in or part of any grand
 numpy-like package so that did require importing two more packages, `rand` and `zipf`.
@@ -248,3 +265,171 @@ maturin develop # Compiles and installs in the current virtual env
 maturin develop --release # Slower compile, 10x faster result
 ```
 
+
+Rust OpenCL Implementation
+==========================
+
+You might think that since this derives from the Rust implementation, this would
+look similar. But it couldn't be further from the truth. Still, to get it running
+you should with all the same things you had for the bare Rust implementation.
+But in this case you should also have a GPU available.
+I'm not a world-class OpenCL expert so don't be too surprised that the speed is not
+a huge improvement over the Rust implementation.
+
+Overview: writing for separate devices
+--------------------------------------
+```
+$ tree src
+src
+├── lib.rs
+└── simulation.cl
+```
+You notice from the start that there are two files where we had one before.
+This is because OpenCL, or any device language like this, works - differently.
+Compiling and using applications like this look like the following:
+
+1. Write your code (easy! 😜)
+2. Compile it (using `maturin develop` or `maturin build` here)
+3. Use it in your Python program, which is interpreted on-the-fly
+4. When you run `Simulation::ocl_repeat_simulate_demand()`, that rust method
+   will use a few C libraries to find the OpenCL implementation on your computer.
+5. The same function passes the source code for `simulation.cl` to the OpenCL
+   implementation and compiles it now
+6. That finishes and gives a reference to the compiled OpenCL kernel.
+7. Run it by giving it arguments and putting it in a queue.
+8. When it completes, you `.enq()?` will return.
+
+It's actually not that difficult to handle, you just need to remember what parts
+are getting checked when you first write your code, and which are not checked
+until it's first run. Everything on the device is not checked until runtime.
+
+There's one more wrinkle. There are now more than one processor and more than one
+memory on your computer. Each processor can only access it's own memory. So using
+a device almost always looks like:
+
+1. Format the data in the simplest format you can (like a few arrays of floats)
+   Make sure there are no links to anything outside of that data.
+2. Choose an `N` to count to. The device function (the "kernel") will be called once
+   for each `i in 0..N`, and the only thing to differentiate the kernel is its `i`
+3. Copy all the input arrays to buffers on the device.
+4. Create output arrays for the buffer to fill with any results.
+   Keep in mind you can't change the size afterward.
+5. Call the kernel, passing it pointers to the copied arrays in it's own memory,
+   and passing any scalars verbatim (which is easy).
+6. The kernel does all its work in memory, modifying its own arrays.
+   It's called once for each element in the work dimension you specify.
+7. Repeat steps 4-5 as much as possible to get your mileage out of the copies
+8. Copy all the output buffers
+
+```
+Host                          Device
+┌───────────────────────────┰─────────────────────
+│ Input                     ┃ 
+│                           ┃ 
+│ Format ───────────> Copy arrays ──┐
+│                           ┃       │ 
+│ Call kernel               ┃       │ Create output arrays
+│                           ┃       │
+├────────> Send pointers & scalars ─┤
+│                           ┃       │
+│ wait..                    ┃       │ Run kernel
+│                           ┃       │
+│ Done.  <── Notify ────────╂───────┤
+│                           ┃       │
+│<─── Copy output arrays ───╂───────┘
+│                           ┃       
+│ Profit?                   ┃
+```
+
+Differences in the code
+-----------------------
+
+There are many places things look different, and usually for good reason
+
+### Precomputed zipf distributions
+
+```rs
+struct Simulation {
+    ...
+    job_lot_zipf_precomp: Vec<u32>,
+    itemwise_traffic_zipf_precomp: Vec<u32>,
+}
+
+/// Precompute some values for a zipf distribution
+/// Used by Simulation but not intended to be visible to Python.
+fn precompute_zipf_buffer(num_elements: usize, exponent: f64) -> Vec<u32> {
+    ...
+}
+
+/// Inside `Simulation::ocl_repeat_simulate_demand()`, we copy those buffers
+let job_lot_zipf_precomp = pro_que.buffer_builder()
+    .len(self.job_lot_zipf_precomp.len())
+    .copy_host_slice(&self.job_lot_zipf_precomp[..])
+    .build()?;
+let itemwise_traffic_zipf_precomp = ... ditto;
+
+```
+And later in OpenCL, we uniformly sample elements from these distributions.
+
+```c
+// Completely by-the-book reference implementation of xorshift
+uint xorshift32(uint* state)
+{
+    /* Algorithm "xor" from p. 4 of Marsaglia, "Xorshift RNGs" */
+    uint x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+// Select an item at random from a buffer
+uint random_select(uint* state, __global uint* precomp, uint len) {
+    return precomp[xorshift32(state) % len];
+}
+```
+But in turn it so happens that the device doesn't have random sources
+so we have to pass it something to get it started.
+```rs
+// We also need to seed the simple uniform random number generator on ocl because it has no randomness of its own
+// So first we compute it on the CPU (the Host)
+let seed : Vec<u32> = (0..chunk_count).into_iter().map(|_| rand::random()).collect();
+// Then send it to the device
+let seed = ... same old copy;
+```
+
+### Other Differences
+
+- I made a sorta-arbitrary limitation that we will only track 10 trucks so that way we can keep it entirely in the kernel. You can put in any (smallish) number here. I just don't want to create a buffer and send it to the kernel just for it's intermediate scratch space.
+- It also made sense to have CL run multiple simulations at a time since then there's even less to copy
+- But you still want to have at least a thousand or a few thousand separate iterations
+
+ OpenCL's part                | Rust's part                     | Why
+------------------------------|---------------------------------|-----
+ `uint trucks[10];`           | `.arg(self.lead_time.min(10))`  | Limit excess copying
+ `for (uint sample=0; ...)`   | `chunk_size = samples / 1000;`  | Reduce copying to/from device
+ `int me = get_global_id(0);` | `let chunk_count = 1000;`       | Balance workload across many cores
+
+Highlights
+----------
+Running an OpenCL kernel is always considered unsafe because you're essentially compiling and running *anything* there. For that reason the API developers marked it as unsafe, and rust emphasizes this to you by making you separate it from the rest in a block like so:
+```rs
+unsafe { kernel.enq()?; }
+```
+
+Installing it for production
+----------------------------
+Technically speaking, there's nothing else you need to do to compile it - sorta. But the issue is that you probably want to run it, and to do that you need an OpenCL environment. On Macbooks it generally just works. For Linux and Windows you need to install the appropriate driver for your hardware.
+
+Installing it for debugging
+---------------------------
+Thankfully, there are already several drivers available that use only the CPU, and will be able to test whether your code works without driving you nuts install drivers. [POCL] is probably your first choice, and you can find most of your options under [IWOCL].
+For Debian Linux we should be able to install it using:
+```sh
+apt install pocl-opencl-icd
+```
+and you'll find that's already done if you use a recent Docker image. 😉
+
+[POCL]: http://portablecl.org/
+[IWOCL]: https://www.iwocl.org/resources/opencl-implementations/
