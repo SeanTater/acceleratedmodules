@@ -170,7 +170,7 @@ impl Simulation {
 }
 
 /// Precompute some values for a zipf distribution
-/// Used by Simuation but not intended to be visible to Python.
+/// Used by Simulation but not intended to be visible to Python.
 fn precompute_zipf_buffer(num_elements: usize, exponent: f64) -> Vec<u32> {
     let z = zipf::ZipfDistribution::new(num_elements, exponent).unwrap();
     let mut rng = rand::thread_rng();
