@@ -1,6 +1,7 @@
 rust*/target
 **/*.rs.bk
-Cargo.lock
+rust*/Cargo.lock
 *.so
 *.dylib
 *.o
+*.tgz

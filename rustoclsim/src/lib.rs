@@ -1,7 +1,7 @@
 use pyo3::prelude::*;
-use pyo3::wrap_pyfunction;
 use rand::distributions::Distribution;
-use std::cmp::max;
+use std::convert::TryInto;
+use ocl::ProQue;
 
 #[pyclass(module = "rustsim")]
 struct Simulation {
@@ -32,94 +32,131 @@ impl Simulation {
         });
     }
 
-    /// Do exactly the same search Python does
-    ///
-    /// This method performs all it's conversions automatically
-    fn simulate_demand_inner(
-        &self,
-        starting_quantity: usize,
-    ) -> (usize, usize, usize, usize, f64, f64) {
-        let mut successful_transactions = 0;
-        let mut successful_sales = 0;
-        let mut failed_transactions = 0;
-        let mut failed_sales = 0;
-        let mut stock = starting_quantity;
-        let mut trucks = vec![0; self.lead_time];
-        let mut rng = rand::thread_rng();
-        let jl_zipf = zipf::ZipfDistribution::new(1000, self.job_lot_zipf).unwrap();
-        let it_zipf = zipf::ZipfDistribution::new(1000, self.itemwise_traffic_zipf).unwrap();
-
-        for day in 0..365 {
-            // A truck arrived
-            stock += trucks[day % self.lead_time];
-            // This many customers arrive
-            for _customer in 0..it_zipf.sample(&mut rng) {
-                // This customer wants this many
-                let request = jl_zipf.sample(&mut rng);
-                if stock >= request {
-                    // There are enough.
-                    successful_transactions += 1;
-                    successful_sales += request;
-                    stock -= request;
-                } else {
-                    // There are not enough
-                    failed_transactions += 1;
-                    failed_sales += request;
-                }
-            }
-            // The day is over. Start making orders.
-            if stock < self.safety_stock {
-                let short = max(self.safety_stock - stock, 0);
-                let orders = (short + self.order_quantity - 1) / self.order_quantity;
-                trucks[(day + self.lead_time - 1) % self.lead_time] = orders * self.order_quantity;
-            }
-        }
-        (
-            successful_transactions,
-            successful_sales,
-            failed_transactions,
-            failed_sales,
-            // Rust enforces that floats and integers stay separate
-            successful_transactions as f64
-                / (successful_transactions as f64 + failed_transactions as f64),
-            successful_sales as f64 / (successful_sales as f64 + failed_sales as f64),
-        )
+    fn repeat_simulate_demand(&self, starting_quantity: usize, count: usize) -> (usize, usize, usize, usize, f64, f64) {
+        self.ocl_repeat_simulate_demand(starting_quantity, count).unwrap()
     }
 
-    /// You can also perform the conversions manually, and you can get access to the Python GIL, which necessary in many cases
-    fn simulate_demand(&self, py: Python<'_>, starting_quantity: usize) -> PyResult<PyObject> {
-        Ok(self.simulate_demand_inner(starting_quantity).into_py(py))
-    }
+}
 
-    /// Repeat the simulation many times
-    fn repeat_simulate_demand(
-        &self,
-        starting_quantity: usize,
-        count: usize,
-    ) -> (usize, usize, usize, usize, f64, f64) {
-        let (mut st, mut ss, mut ft, mut fs) = (0, 0, 0, 0);
-        for _ in 0..count {
-            let (xst, xss, xft, xfs, _, _) = self.simulate_demand_inner(starting_quantity);
-            st += xst;
-            ss += xss;
-            ft += xft;
-            fs += xfs;
-        }
-        (
-            st,
-            ss,
-            ft,
-            fs,
+// NB: These methods are not accessible from Python
+impl Simulation {
+    /// OpenCL implementation of repeat_simulate_demand
+    /// 
+    /// Includes a rewritten version of simulate_demand.
+    /// There are several differences:
+    /// 
+    /// 1. I don't want the bulk of the computation to be generating a perfect zipf distribution
+    ///    when I know we got that by eyeballing the curve anyway. So instead I generate a
+    ///    pretty large sample and put up with a small period (of like 16M elements)
+    /// 
+    fn ocl_repeat_simulate_demand(&self, starting_quantity: usize, simulation_samples: usize) -> ocl::Result<(usize, usize, usize, usize, f64, f64)> {
+
+        // This is the embedded opencl program we're going to run inside our app.
+        // It may be easier to understand if you read this last
+
+        // Think of this program queue as your connection to the device
+        let pro_que = ProQue::builder()
+            .src(include_str!("simulation.cl"))
+            .dims(simulation_samples)
+            .build()?;
+
+        // These two are precomputed zipf distributions, to make sampling from these distributions
+        // faster and simpler to implement. But it does spend CPU time before you start.
+        let precomp_size = 16<<20;
+        let job_lot_zipf_precomp         = precompute_zipf_buffer(&pro_que, 1000, self.job_lot_zipf,          precomp_size)?;
+        let itemise_traffic_zipf_precomp = precompute_zipf_buffer(&pro_que, 1000, self.itemwise_traffic_zipf, precomp_size)?;
+
+        // We also need to seed the simple uniform random number generator on ocl because it has no randomness of its own
+        // So first we compute it on the CPU (the Host)
+        let seed : Vec<u32> = (0..simulation_samples).into_iter().map(|_| rand::random()).collect();
+        // Then send it to the device
+        let seed = pro_que.buffer_builder::<u32>()
+            .len(simulation_samples)
+            .copy_host_slice(&seed[..])
+            .build()?;
+
+        // These four are the resulting statistics, to be filled in by the device
+        let successful_transactions = pro_que.create_buffer::<u64>()?;
+        let successful_sales        = pro_que.create_buffer::<u64>()?;
+        let failed_transactions     = pro_que.create_buffer::<u64>()?;
+        let failed_sales            = pro_que.create_buffer::<u64>()?;
+
+
+        let kernel = pro_que.kernel_builder("ocl_simulate_demand")
+            .arg(&seed)
+            .arg(&job_lot_zipf_precomp)
+            .arg(&itemise_traffic_zipf_precomp)
+            .arg(&successful_transactions)
+            .arg(&successful_sales)
+            .arg(&failed_transactions)
+            .arg(&failed_sales)
+            .arg(starting_quantity)
+            .arg(self.lead_time.min(10))
+            .arg(self.safety_stock as i32)
+            .arg(self.order_quantity as i32)
+            .arg(precomp_size)
+            .build()?;
+
+        unsafe { kernel.enq()?; }
+
+        // Copy the statistics back. It doesn't have to be this hard.
+        // But I want to explain it all in detail because I figure you'll spend a lot of your time
+        // doing exactly this.
+        
+        // I did it by making a single vector, which the closure will take control of (hence "move")
+        let mut vec = vec![0u64; simulation_samples];
+        let mut get_sum = move |buffer: &ocl::Buffer<u64>| -> ocl::Result<usize> {
+            // This copies the device buffer into our host vector.
+            buffer.read(&mut vec).enq()?;
+            // This iterates over it and sums it into a u64.
+            // It would be a good idea to keep it as u64 because - who knows - maybe we want to
+            // sell more than 4 billion widgets. But they are purposely inconvenient to work with
+            // because they are also inconvenient for some computers to work with and they will
+            // slow you down on the GPU. Usize, however, is whichever size numbers your computer
+            // naturally uses. So we convert it to that and ignore the possible tragedy. We'll
+            // just show the max we can if we are limited. Good? No. But easy and maybe good enough
+            Ok(vec.iter().copied().sum::<u64>().try_into().unwrap_or(::std::usize::MAX))
+        };
+        let st = get_sum(&successful_transactions)?;
+        let ss = get_sum(&successful_sales)?;
+        let ft = get_sum(&failed_transactions)?;
+        let fs = get_sum(&failed_sales)?;
+
+        Ok((st, ss, ft, fs,
             st as f64 / (st as f64 + ft as f64),
-            ss as f64 / (ss as f64 + fs as f64),
-        )
+            ss as f64 / (ss as f64 + fs as f64)))
     }
+
+}
+
+/// Precompute some values for a zipf distribution
+/// Used by Simuation but not intended to be visible to Python.
+fn precompute_zipf_buffer(pro_que: &ProQue, num_elements: usize, exponent: f64, size: usize) -> ocl::Result<ocl::Buffer<u32>> {
+    let z = zipf::ZipfDistribution::new(num_elements, exponent).unwrap();
+    let mut rng = rand::thread_rng();
+    let v: Vec<u32> = (0..size).into_iter().map(|_| z.sample(&mut rng) as u32).collect();
+    pro_que.buffer_builder()
+            .len(size)
+            .copy_host_slice(&v[..])
+            .build()
 }
 
 /// This module is a python module implemented in Rust.
 #[pymodule]
-fn rustsim(_py: Python, m: &PyModule) -> PyResult<()> {
+fn rustoclsim(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<Simulation>()?;
 
     Ok(())
+}
+
+#[test]
+fn test_ocl() {
+    let sim = Simulation {
+        safety_stock: 10,
+        lead_time: 10,
+        order_quantity: 7,
+        job_lot_zipf: 2.75,
+        itemwise_traffic_zipf: 4.0,
+    };
+    sim.ocl_repeat_simulate_demand(10, 10000).expect("OCL Failed");
 }

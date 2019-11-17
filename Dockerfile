@@ -1,6 +1,6 @@
 FROM debian
 RUN apt-get update \
-    && apt-get install -y git wget python3-pip python3-venv  \
+    && apt-get install -y git wget python3-pip python3-venv beignet-opencl-icd opencl-headers ocl-icd-opencl-dev python3-dev cpio \
     && python3 -m venv ~/venv \
     && (echo source ~/venv/bin/activate >> ~/.bashrc ) \
     && pip3 install maturin cython numpy \

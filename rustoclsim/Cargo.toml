@@ -1,5 +1,5 @@
 [package]
-name = "rustsim"
+name = "rustoclsim"
 version = "0.1.0"
 authors = ["Sean Gallagher <stgallag@gmail.com>"]
 edition = "2018"
@@ -9,9 +9,10 @@ edition = "2018"
 [dependencies]
 rand = "^0.7"
 zipf = "^6.1"
+ocl = "^0.19"
 
 [lib]
-name = "rustsim"
+name = "rustoclsim"
 crate-type = ["cdylib"]
 
 [dependencies.pyo3]
