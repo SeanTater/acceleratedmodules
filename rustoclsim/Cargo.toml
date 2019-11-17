@@ -10,6 +10,7 @@ edition = "2018"
 rand = "^0.7"
 zipf = "^6.1"
 ocl = "^0.19"
+failure = "^0.1"
 
 [lib]
 name = "rustoclsim"
