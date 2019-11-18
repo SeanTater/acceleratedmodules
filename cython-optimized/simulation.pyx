@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import numpy as np
 cimport numpy as np
-import random
 
 cdef class Simulation:
     ''' Simulates the demand of one product over time

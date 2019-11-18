@@ -4,6 +4,7 @@ Stock Simulation: An example of Python native modules
 - [Stock Simulation: An example of Python native modules](#stock-simulation-an-example-of-python-native-modules)
 - [Basic Implementation](#basic-implementation)
 - [Cython Stock Simulation](#cython-stock-simulation)
+- [Better Cython Simulation](#better-cython-simulation)
 - [Rust Stock Simulation](#rust-stock-simulation)
     - [Cargo.toml](#cargotoml)
     - [lib.rs](#librs)
@@ -84,6 +85,90 @@ simulation.Simulation(2, 3, 2).repeat_simulate_demand(10, 10000)
 
 Sadly, it's no improvement over bare Python as it stands. To get more out of it, you need to bend
 a little. If you look at the resulting `simulation.c`, you can imagine why the result is not faster. There are tons of corner cases Python handles for you that make it convenient for you as a developer and a user but waste a ton of CPU cycles.
+
+Better Cython Simulation
+========================
+If it's worth writing for Cython at all, then it's worth improving it to use more of Cython's power.
+
+For starters, we should define the types of all our variables in each function we're going to use, so that Cython doesn't revert to interpreting:
+
+```py
+cpdef simulate_demand(self, int starting_quantity):
+    cdef int successful_transactions = 0
+    cdef int successful_sales = 0
+    cdef int failed_transactions = 0
+    cdef int failed_sales = 0
+    cdef int stock = starting_quantity
+    cdef list trucks = [0] * self.lead_time
+
+    cdef unsigned int state = np.random.randint(1<<32)
+
+    # Everything else defined later
+    cdef int day, customer, request, short, orders
+
+    for day in range(365):
+            # A truck arrived
+            stock += trucks[day % self.lead_time]
+            # The rest is as normal
+```
+
+The class should be defined similarly, giving the types of everything we plan to use.
+In order to do this we also have to include `cimport` for some types too. Namely, because we want to use `np.ndarray` as a type. 
+
+```py
+#!/usr/bin/env python3
+import numpy as np
+cimport numpy as np
+
+cdef class Simulation:
+    ''' Simulates the demand of one product over time ...
+    '''
+    cdef int safety_stock
+    cdef int lead_time
+    cdef int order_quantity
+    cdef double job_lot_zipf
+    cdef double itemwise_traffic_zipf
+    cdef np.ndarray job_lot_zipf_precomp
+    cdef np.ndarray itemwise_traffic_zipf_precomp
+```
+
+Similarly, you'll need to let the compiler know where numpy's headers are so it can import them. Numpy makes that pretty painless to do since it's the most popular library for Cython to compile against.
+
+```py
+#!/usr/bin/env python3
+# setup.py
+from distutils.core import setup
+from Cython.Build import cythonize
+import numpy # <- You need this in order to find the includes
+
+setup(
+    ext_modules = cythonize(
+        "simulation.pyx",
+        language_level=3  # <- This is a matter of taste I guess
+    ),
+    include_dirs=[numpy.get_include()] # <- This is the include you want
+)
+```
+
+We also do the same precomputing we will later do (and explain more) in OpenCL. Note that it is possible to send pointers to integers in Cython like it is in C. You're required to treat it as an array however. So `*state = x` doesn't work.
+
+```py
+# Completely by-the-book reference implementation of xorshift
+cdef unsigned int xorshift32(unsigned int* state):
+    # Algorithm "xor" from p. 4 of Marsaglia, "Xorshift RNGs"
+    cdef unsigned int x = state[0]
+    x ^= x << 13
+    x ^= x >> 17
+    x ^= x << 5
+    state[0] = x
+    return x
+
+# Select an item at random from a buffer
+cdef unsigned int random_select(unsigned int* state, np.ndarray[np.int64_t, ndim=1] precomp):
+    return precomp[xorshift32(state) % precomp.shape[0]]
+```
+
+The result is better than Python now. But contain your excitement a bit; it gets much better later.
 
 Rust Stock Simulation
 =====================
